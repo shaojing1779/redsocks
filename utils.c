@@ -620,4 +620,15 @@ int resolve_hostname(const char *hostname, int sa_family, struct sockaddr *addr)
     }
 }
 
+void set_sockaddr_port(struct sockaddr_storage * addr, uint16_t port) {
+    if (addr->ss_family == AF_INET) {
+        ((struct sockaddr_in *)addr)->sin_port = port;
+    }
+    else if (addr->ss_family == AF_INET6) {
+        ((struct sockaddr_in6 *)addr)->sin6_port = port;
+    }
+    else {
+        log_error(LOG_ERR, "Unknown address type: %d", addr->ss_family);
+    }
+}
 /* vim:set tabstop=4 softtabstop=4 shiftwidth=4: */

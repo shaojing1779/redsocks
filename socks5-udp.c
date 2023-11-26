@@ -31,7 +31,10 @@
 
 typedef struct socks5_expected_assoc_reply_t {
     socks5_reply h;
-    socks5_addr_ipv4 ip;
+    union {
+        socks5_addr_ipv4 v4;
+        socks5_addr_ipv6 v6;
+    };
 } PACKED socks5_expected_assoc_reply;
 
 static struct evbuffer* socks5_mkmethods_plain_wrapper(void *p)
@@ -48,10 +51,7 @@ static struct evbuffer* socks5_mkpassword_plain_wrapper(void *p)
 
 static struct evbuffer* socks5_mkassociate(void *p)
 {
-    struct sockaddr_storage sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.ss_family = ((const struct sockaddr_storage *)p)->ss_family;
-    return socks5_mkcommand_plain(socks5_cmd_udp_associate, &sa);
+    return socks5_mkcommand_plain(socks5_cmd_udp_associate, p);
 }
 
 static void socks5_fill_preamble(
@@ -85,7 +85,7 @@ static void socks5_fill_preamble(
 
 typedef struct socks5_client_t {
     struct event        udprelay;
-    struct sockaddr_in  udprelayaddr;
+    struct sockaddr_storage udprelayaddr;
     struct bufferevent *relay;
     int ready_fwd;
 } socks5_client;
@@ -129,9 +129,9 @@ static void socks5_forward_pkt(redudp_client *client, struct sockaddr *destaddr,
     struct iovec io[2];
     size_t preamble_len = 0;
 
-    if (socks5client->udprelayaddr.sin_family != AF_INET && socks5client->udprelayaddr.sin_family != AF_INET6) {
+    if (socks5client->udprelayaddr.ss_family != AF_INET && socks5client->udprelayaddr.ss_family != AF_INET6) {
         redudp_log_errno(client, LOG_WARNING, "Unknown address type %d",
-                         socks5client->udprelayaddr.sin_family);
+                         socks5client->udprelayaddr.ss_family);
         return;
     }
 
@@ -192,9 +192,8 @@ static void socks5_pkt_from_socks(int fd, short what, void *_arg)
         return;
     }
 
-    if (pkt->header.addrtype != socks5_addrtype_ipv4) {
-        redudp_log_error(client, LOG_NOTICE, "Got address type #%u instead of expected #%u (IPv4).",
-                         pkt->header.addrtype, socks5_addrtype_ipv4);
+    if (pkt->header.addrtype != socks5_addrtype_ipv4 && pkt->header.addrtype != socks5_addrtype_ipv6) {
+        redudp_log_error(client, LOG_NOTICE, "Got address type #%u.", pkt->header.addrtype);
         return;
     }
 
@@ -222,44 +221,86 @@ static void socks5_pkt_from_socks(int fd, short what, void *_arg)
 }
 
 
+static size_t calc_assoc_reply_size(int ss_family) {
+    size_t reply_size = sizeof(socks5_reply);
+    if (ss_family == AF_INET)
+        reply_size += sizeof(socks5_addr_ipv4);
+    else if (ss_family == AF_INET6)
+        reply_size += sizeof(socks5_addr_ipv6);
+    return reply_size;
+}
+
 static void socks5_read_assoc_reply(struct bufferevent *buffev, void *_arg)
 {
     redudp_client *client = _arg;
     socks5_client *socks5client = (void*)(client + 1);
-    socks5_expected_assoc_reply reply;
-    int read = evbuffer_remove(bufferevent_get_input(buffev), &reply, sizeof(reply));
+    struct evbuffer * input = bufferevent_get_input(buffev);
     int fd = -1;
     int error;
+    size_t max_reply_size = calc_assoc_reply_size(AF_INET6);
+
+    // Inspect reply code
+    {
+        socks5_reply * reply = (socks5_reply *)evbuffer_pullup(input, -1);
+        size_t data_size = evbuffer_get_length(input);
+
+        if (data_size < sizeof(socks5_reply)) {
+            // Wait for more data
+            bufferevent_setwatermark(buffev, EV_READ, sizeof(socks5_reply), max_reply_size);
+            return;
+        }
+        if (reply->ver != socks5_ver) {
+            redudp_log_error(client, LOG_NOTICE, "Socks5 server reported unexpected reply version: %u", reply->ver);
+            goto fail;
+        }
+        if (reply->status != socks5_status_succeeded) {
+            redudp_log_error(client, LOG_NOTICE, "Socks5 server status: \"%s\" (%i)",
+                    socks5_status_to_str(reply->status), reply->status);
+            goto fail;
+        }
+        if (reply->addrtype == socks5_addrtype_ipv4)
+            max_reply_size = calc_assoc_reply_size(AF_INET);
+        else if (reply->addrtype == socks5_addrtype_ipv6)
+            max_reply_size = calc_assoc_reply_size(AF_INET6);
+        else {
+            redudp_log_error(client, LOG_NOTICE, "Socks5 server replies bad address type: %d", reply->addrtype);
+            goto fail;
+        }
+
+        if (data_size < max_reply_size) {
+            // Wait for more data
+            bufferevent_setwatermark(buffev, EV_READ, max_reply_size, max_reply_size);
+            return;
+        }
+    }
+    // Enough data received
+    socks5_expected_assoc_reply reply;
+    int read = evbuffer_remove(bufferevent_get_input(buffev), &reply, max_reply_size);
     redudp_log_error(client, LOG_DEBUG, "<trace>");
 
-    if (read != sizeof(reply)) {
+    if (read != max_reply_size) {
+        // Should never occur
         redudp_log_errno(client, LOG_NOTICE, "evbuffer_remove returned only %i bytes instead of expected %zu",
-                         read, sizeof(reply));
+                         read, max_reply_size);
         goto fail;
     }
 
-    if (reply.h.ver != socks5_ver) {
-        redudp_log_error(client, LOG_NOTICE, "Socks5 server reported unexpected reply version: %u", reply.h.ver);
-        goto fail;
+    // Use relay address instead of address in reply.
+    // Unless server allocates different IP for UDP association,
+    // this should work.
+    // Use port number from UDP association reply as destination
+    // port.
+    memcpy(&socks5client->udprelayaddr,
+            &client->instance->config.relayaddr,
+            sizeof(struct sockaddr_storage));
+    if (reply.h.addrtype == socks5_addrtype_ipv4) {
+        set_sockaddr_port(&socks5client->udprelayaddr, reply.v4.port);
+    }
+    else if (reply.h.addrtype == socks5_addrtype_ipv6) {
+        set_sockaddr_port(&socks5client->udprelayaddr, reply.v6.port);
     }
 
-    if (reply.h.status != socks5_status_succeeded) {
-        redudp_log_error(client, LOG_NOTICE, "Socks5 server status: \"%s\" (%i)",
-                socks5_status_to_str(reply.h.status), reply.h.status);
-        goto fail;
-    }
-
-    if (reply.h.addrtype != socks5_addrtype_ipv4) {
-        redudp_log_error(client, LOG_NOTICE, "Socks5 server reported unexpected address type for UDP dgram destination: %u",
-                         reply.h.addrtype);
-        goto fail;
-    }
-
-    socks5client->udprelayaddr.sin_family = AF_INET;
-    socks5client->udprelayaddr.sin_port = reply.ip.port;
-    socks5client->udprelayaddr.sin_addr.s_addr = reply.ip.addr;
-
-    fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    fd = socket(socks5client->udprelayaddr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
     if (fd == -1) {
         redudp_log_errno(client, LOG_ERR, "socket");
         goto fail;
@@ -270,7 +311,6 @@ static void socks5_read_assoc_reply(struct bufferevent *buffev, void *_arg)
         redudp_log_errno(client, LOG_ERR, "evutil_make_socket_nonblocking");
         goto fail;
     }
-
 
     error = connect(fd, (struct sockaddr*)&socks5client->udprelayaddr, sizeof(socks5client->udprelayaddr));
     if (error) {
@@ -288,7 +328,6 @@ static void socks5_read_assoc_reply(struct bufferevent *buffev, void *_arg)
     socks5client->ready_fwd = 1;
     redudp_flush_queue(client);
     // TODO: bufferevent_disable ?
-
     return;
 
 fail:
@@ -318,9 +357,10 @@ static void socks5_read_auth_reply(struct bufferevent *buffev, void *_arg)
         goto fail;
     }
 
+    size_t reply_size = calc_assoc_reply_size(client->instance->config.relayaddr.ss_family);
     error = redsocks_write_helper_ex_plain(
             socks5client->relay, NULL, socks5_mkassociate, &client->destaddr, 0,
-            sizeof(socks5_expected_assoc_reply), sizeof(socks5_expected_assoc_reply));
+            sizeof(socks5_reply), reply_size);
     if (error)
         goto fail;
 
@@ -341,7 +381,7 @@ static void socks5_read_auth_methods(struct bufferevent *buffev, void *_arg)
     int read = evbuffer_remove(bufferevent_get_input(buffev), &reply, sizeof(reply));
     const char *error = NULL;
     int ierror = 0;
-    redudp_log_error(client, LOG_DEBUG, "<trace>");
+    redudp_log_error(client, LOG_DEBUG, "do_password: %d", do_password);
 
     if (read != sizeof(reply)) {
         redudp_log_errno(client, LOG_NOTICE, "evbuffer_remove returned only %i bytes instead of expected %zu",
@@ -355,12 +395,12 @@ static void socks5_read_auth_methods(struct bufferevent *buffev, void *_arg)
         goto fail;
     }
     else if (reply.method == socks5_auth_none) {
+        size_t reply_size = calc_assoc_reply_size(client->instance->config.relayaddr.ss_family);
         ierror = redsocks_write_helper_ex_plain(
                 socks5client->relay, NULL, socks5_mkassociate, &client->destaddr, 0,
-                sizeof(socks5_expected_assoc_reply), sizeof(socks5_expected_assoc_reply));
+                sizeof(socks5_reply), reply_size);
         if (ierror)
             goto fail;
-
         replace_readcb(socks5client->relay, socks5_read_assoc_reply);
     }
     else if (reply.method == socks5_auth_password) {
@@ -369,7 +409,6 @@ static void socks5_read_auth_methods(struct bufferevent *buffev, void *_arg)
                 sizeof(socks5_auth_reply), sizeof(socks5_auth_reply));
         if (ierror)
             goto fail;
-
         replace_readcb(socks5client->relay, socks5_read_auth_reply);
     }
 
@@ -421,13 +460,13 @@ static void socks5_connect_relay(redudp_client *client)
 {
     socks5_client *socks5client = (void*)(client + 1);
     socks5client->relay = red_connect_relay(
-           NULL,
-           &client->instance->config.relayaddr,
-           NULL,
-           socks5_relay_connected,
-           socks5_relay_error,
-           client,
-           NULL);
+            NULL,
+            &client->instance->config.relayaddr,
+            NULL,
+            socks5_relay_connected,
+            socks5_relay_error,
+            client,
+            NULL);
     if (!socks5client->relay)
         redudp_drop_client(client);
 }
