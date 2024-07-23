@@ -5,3 +5,4 @@ redsocks2
 gen/
 .depend
 xnu/
+.vscode
