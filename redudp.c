@@ -73,17 +73,21 @@ struct bound_udp {
     time_t t_last_rx;
 };
 
+
 extern udprelay_subsys socks5_udp_subsys;
+/*
 #if !defined(DISABLE_SHADOWSOCKS)
 extern udprelay_subsys shadowsocks_udp_subsys;
 #endif
+*/
 static udprelay_subsys *relay_subsystems[] =
 {
     &socks5_udp_subsys,
-    #if !defined(DISABLE_SHADOWSOCKS)
-    &shadowsocks_udp_subsys,
-    #endif
+    // #if !defined(DISABLE_SHADOWSOCKS)
+    // &shadowsocks_udp_subsys,
+    // #endif
 };
+
 /***********************************************************************
  * Helpers
  */

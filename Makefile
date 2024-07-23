@@ -1,75 +1,69 @@
-ifdef DISABLE_SHADOWSOCKS
-OBJS := parser.o main.o redsocks.o log.o direct.o ipcache.o autoproxy.o http-connect.o \
-        socks4.o socks5.o http-relay.o base.o base64.o md5.o http-auth.o utils.o redudp.o socks5-udp.o \
-        tcpdns.o gen/version.o
-CFLAGS +=-fPIC -O3 -DDISABLE_SHADOWSOCKS
-FEATURES += DISABLE_SHADOWSOCKS
-else
-OBJS := parser.o main.o redsocks.o log.o direct.o ipcache.o autoproxy.o encrypt.o shadowsocks.o http-connect.o \
-        socks4.o socks5.o http-relay.o base.o base64.o md5.o http-auth.o utils.o redudp.o socks5-udp.o shadowsocks-udp.o \
-        tcpdns.o gen/version.o
-CFLAGS +=-fPIC -O3
-endif
-SRCS := $(OBJS:.o=.c)
+# Variables
+VERSION := 0.68
+OUT := redsocks2
+OS := $(shell uname)
+CFLAGS := -fPIC -O3
+LIBS := -levent
 CONF := config.h
 DEPS := .depend
-OUT := redsocks2
-VERSION := 0.68
-OS := $(shell uname)
-
-LIBS := -levent
-override CFLAGS += -D_BSD_SOURCE -D_DEFAULT_SOURCE -Wall
-ifeq ($(OS), Linux)
-override CFLAGS += -std=c99 -D_XOPEN_SOURCE=600
-endif
-ifeq ($(OS), FreeBSD)
-override CFLAGS +=-I/usr/local/include -L/usr/local//lib
-endif
-ifeq ($(OS), OpenBSD)
-override CFLAGS +=-I/usr/local/include -L/usr/local//lib #same as FreeBSD
-endif
-ifeq ($(OS), Darwin)
-override CFLAGS +=-I/usr/local/opt/openssl/include -L/usr/local/opt/openssl/lib
-SHELL := /bin/bash
-OSX_VERSION := $(shell sw_vers -productVersion | cut -d '.' -f 1,2)
-OSX_ROOT_PATH := xnu
-OSX_HEADERS_PATH := $(OSX_ROOT_PATH)/$(OSX_VERSION)
-OSX_HEADERS := $(OSX_HEADERS_PATH)/net/pfvar.h $(OSX_HEADERS_PATH)/net/radix.h $(OSX_HEADERS_PATH)/libkern/tree.h
-override CFLAGS +=-I$(OSX_HEADERS_PATH)
-endif
-
-
-#LDFLAGS += -fwhole-program
-ifdef USE_CRYPTO_POLARSSL
-override LIBS += -lpolarssl
-override CFLAGS += -DUSE_CRYPTO_POLARSSL
-$(info Compile with PolarSSL.)
-CRYPTO := PolarSSL
-else
-$(info Compile with OpenSSL by default. To compile with PolarSSL, run 'make USE_CRYPTO_POLARSSL=true' instead.)
 CRYPTO := OpenSSL
+
+# Define OpenSSL and other directories
+OPENSSL_DIR := /usr/local/openssl-1.0.2
+INCLUDE_DIRS := $(OPENSSL_DIR)/include
+LIB_DIRS := $(OPENSSL_DIR)/lib
+
+ifeq ($(OS), FreeBSD)
+INCLUDE_DIRS += /usr/local/include
+LIB_DIRS += /usr/local/lib
+endif
+
+ifeq ($(OS), OpenBSD)
+INCLUDE_DIRS += /usr/local/include
+LIB_DIRS += /usr/local/lib
+endif
+
+ifdef USE_CRYPTO_POLARSSL
+CRYPTO := PolarSSL
+LIBS += -lpolarssl
+CFLAGS += -DUSE_CRYPTO_POLARSSL
+$(info Compile with PolarSSL.)
+else
+LIBS += -lssl -lcrypto
+CFLAGS += -DUSE_CRYPTO_OPENSSL
+endif
+
 ifdef ENABLE_HTTPS_PROXY
-override OBJS += https-connect.o
-override LIBS += -levent_openssl
-override CFLAGS += -DENABLE_HTTPS_PROXY
-override FEATURES += ENABLE_HTTPS_PROXY
+LIBS += -levent_openssl
+CFLAGS += -DENABLE_HTTPS_PROXY
 $(info Compile with HTTPS proxy enabled.)
 endif
-override LIBS += -lssl -lcrypto
-ifneq ($(OS), OpenBSD)
-override LIBS += -ldl
-endif
-override CFLAGS += -DUSE_CRYPTO_OPENSSL
-endif
+
 ifdef ENABLE_STATIC
-override LIBS += -lz
-override LDFLAGS += -Wl,-static -static -static-libgcc -s
-override FEATURES += STATIC_COMPILE
+LIBS += -lz
+LDFLAGS += -Wl,-static -static -static-libgcc -s
 endif
 
+# Compiler and linker flags
+override CFLAGS += -D_BSD_SOURCE -D_DEFAULT_SOURCE -Wall
+override CFLAGS += -std=c99
+override CFLAGS += -I$(INCLUDE_DIRS)
+override LDFLAGS += -L$(LIB_DIRS)
+
+# Source files and objects
+SRCS := $(OBJS:.o=.c)
+OBJS := parser.o main.o redsocks.o log.o direct.o ipcache.o autoproxy.o \
+        encrypt.o shadowsocks.o http-connect.o socks4.o socks5.o http-relay.o \
+        base.o base64.o md5.o http-auth.o utils.o redudp.o socks5-udp.o \
+        tcpdns.o gen/version.o
+
+ifdef ENABLE_HTTPS_PROXY
+OBJS += https-connect.o $(OBJS)
+endif
+# Targets
 all: $(OUT)
 
-.PHONY: all clean distclean
+.PHONY: all clean distclean tags
 
 tags: *.c *.h
 	ctags -R
@@ -79,17 +73,8 @@ $(CONF):
 	Linux*) \
 		echo "#define USE_IPTABLES" >$(CONF) \
 		;; \
-	FreeBSD) \
+	FreeBSD|OpenBSD|NetBSD) \
 		echo "#define USE_PF" >$(CONF) \
-		;; \
-	OpenBSD) \
-		echo "#define USE_PF" >$(CONF) \
-		;; \
-	NetBSD) \
-                echo "#define USE_PF" >$(CONF) \
-                ;; \
-	Darwin) \
-		echo -e "#define USE_PF\n#define _APPLE_" >$(CONF) \
 		;; \
 	*) \
 		echo "Unknown system, only generic firewall code is compiled" 1>&2; \
@@ -97,7 +82,6 @@ $(CONF):
 		;; \
 	esac
 
-# Dependency on .git is useful to rebuild `version.c' after commit, but it breaks non-git builds.
 gen/version.c: *.c *.h gen/.build
 	$(RM) -f $@.tmp
 	echo '/* this file is auto-generated during build */' > $@.tmp
@@ -124,16 +108,7 @@ gen/.build:
 
 base.c: $(CONF)
 
-ifeq ($(OS), Darwin)
-$(OSX_HEADERS_PATH)/net/pfvar.h:
-	mkdir -p $(OSX_HEADERS_PATH)/net && curl -o $(OSX_HEADERS_PATH)/net/pfvar.h https://raw.githubusercontent.com/apple/darwin-xnu/master/bsd/net/pfvar.h
-$(OSX_HEADERS_PATH)/net/radix.h:
-	mkdir -p $(OSX_HEADERS_PATH)/net && curl -o $(OSX_HEADERS_PATH)/net/radix.h https://raw.githubusercontent.com/apple/darwin-xnu/master/bsd/net/radix.h
-$(OSX_HEADERS_PATH)/libkern/tree.h:
-	mkdir -p $(OSX_HEADERS_PATH)/libkern && curl -o $(OSX_HEADERS_PATH)/libkern/tree.h https://raw.githubusercontent.com/apple/darwin-xnu/master/libkern/libkern/tree.h
-endif
-
-$(DEPS): $(OSX_HEADERS) $(SRCS)
+$(DEPS): $(SRCS)
 	$(CC) -MM $(CFLAGS) $(SRCS) 2>/dev/null >$(DEPS) || \
 	( \
 		for I in $(wildcard *.h); do \
@@ -168,4 +143,3 @@ distclean: clean
 	$(RM) $(OUT)
 	$(RM) tags $(DEPS)
 	$(RM) -r gen
-	$(RM) -r $(OSX_ROOT_PATH)
